@@ -1428,3 +1428,151 @@ pub enum OsType {
     Tvos,
     VisionOs,
 }
+
+#[cfg(test)]
+mod lazy_command_buffer_tests {
+    //! PROTOTYPE tests for lazy `MTLCommandBuffer` creation. They need a Metal device
+    //! and skip (pass) without one.
+    use super::*;
+    use crate::{Adapter as _, CommandEncoder as _, Device as _, Instance as _, Queue as _};
+
+    fn open_device() -> Option<crate::OpenDevice<Api>> {
+        let instance = unsafe {
+            Instance::init(&crate::InstanceDescriptor {
+                name: "metal lazy command buffer tests",
+                flags: wgt::InstanceFlags::empty(),
+                memory_budget_thresholds: Default::default(),
+                backend_options: Default::default(),
+                telemetry: None,
+                display: None,
+            })
+        }
+        .ok()?;
+        let adapter = unsafe { instance.enumerate_adapters(None) }
+            .into_iter()
+            .next()?
+            .adapter;
+        unsafe {
+            adapter.open(
+                wgt::Features::empty(),
+                &wgt::Limits::default(),
+                &wgt::MemoryHints::default(),
+            )
+        }
+        .ok()
+    }
+
+    fn outstanding(queue: &Queue) -> usize {
+        queue
+            .shared
+            .command_buffer_created_not_submitted
+            .load(atomic::Ordering::Acquire)
+    }
+
+    /// Budget exhaustion must stay a recoverable `DeviceError::Lost` from
+    /// `begin_encoding` (not a panic at first use), and must not leak a slot.
+    #[test]
+    fn exhausted_budget_is_an_error_not_a_panic() {
+        let Some(crate::OpenDevice { device, queue }) = open_device() else {
+            std::eprintln!("skipped: no Metal adapter");
+            return;
+        };
+        std::eprintln!("metal device opened");
+        unsafe {
+            let mut encoder = device
+                .create_command_encoder(&crate::CommandEncoderDescriptor {
+                    label: None,
+                    queue: &queue,
+                })
+                .unwrap();
+            queue
+                .shared
+                .command_buffer_created_not_submitted
+                .store(adapter::MAX_COMMAND_BUFFERS, atomic::Ordering::Release);
+            assert!(matches!(
+                encoder.begin_encoding(None),
+                Err(crate::DeviceError::Lost)
+            ));
+            assert_eq!(outstanding(&queue), adapter::MAX_COMMAND_BUFFERS);
+            queue
+                .shared
+                .command_buffer_created_not_submitted
+                .store(0, atomic::Ordering::Release);
+            // The encoder is still usable once budget is available again.
+            encoder.begin_encoding(None).unwrap();
+            assert_eq!(outstanding(&queue), 1);
+            encoder.discard_encoding();
+            assert_eq!(outstanding(&queue), 0);
+        }
+    }
+
+    /// Empty encodings create no native buffer and give their slot back at
+    /// `end_encoding`; a buffer with work is committed and signals the fence.
+    #[test]
+    fn empty_encodings_create_nothing_and_release_their_slot() {
+        let Some(crate::OpenDevice { device, queue }) = open_device() else {
+            return;
+        };
+        if !lazy_command_buffers() {
+            return;
+        }
+        unsafe {
+            let mut encoder = device
+                .create_command_encoder(&crate::CommandEncoderDescriptor {
+                    label: None,
+                    queue: &queue,
+                })
+                .unwrap();
+            let buffer = device
+                .create_buffer(&crate::BufferDescriptor {
+                    label: None,
+                    size: 64,
+                    usage: wgt::BufferUses::COPY_DST | wgt::BufferUses::MAP_READ,
+                    memory_flags: crate::MemoryFlags::empty(),
+                })
+                .unwrap();
+            let fence = device.create_fence().unwrap();
+            let commands = (0..4)
+                .map(|index: usize| {
+                    // Only the encoding with work (index 1) keeps its slot until submit.
+                    let held = usize::from(index >= 2);
+                    encoder.begin_encoding(None).unwrap();
+                    assert_eq!(outstanding(&queue), held + 1);
+                    if index == 1 {
+                        encoder.clear_buffer(&buffer, 0..64);
+                    }
+                    let cb = encoder.end_encoding().unwrap();
+                    assert_eq!(outstanding(&queue), held + usize::from(index == 1));
+                    cb
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                commands.iter().map(|c| c.raw.is_some()).collect::<Vec<_>>(),
+                [false, true, false, false]
+            );
+            queue
+                .submit(&commands.iter().collect::<Vec<_>>(), &[], (&fence, 1))
+                .unwrap();
+            assert_eq!(outstanding(&queue), 0);
+            assert!(device
+                .wait(&fence, 1, Some(core::time::Duration::from_secs(10)))
+                .unwrap());
+            // An all-empty submit still signals (extra command buffer path).
+            let empty = [{
+                encoder.begin_encoding(None).unwrap();
+                encoder.end_encoding().unwrap()
+            }];
+            queue
+                .submit(&empty.iter().collect::<Vec<_>>(), &[], (&fence, 2))
+                .unwrap();
+            assert!(device
+                .wait(&fence, 2, Some(core::time::Duration::from_secs(10)))
+                .unwrap());
+            drop(commands);
+            drop(empty);
+            assert_eq!(outstanding(&queue), 0);
+            device.destroy_buffer(buffer);
+            device.destroy_fence(fence);
+        }
+    }
+}

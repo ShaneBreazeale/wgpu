@@ -163,15 +163,11 @@ impl super::CommandEncoder {
         self.raw_cmd_buf.as_deref()
     }
 
-    /// Create the `MTLCommandBuffer` for the current encoding if it doesn't exist yet.
-    fn create_raw_command_buffer(
-        &mut self,
-        label: Option<&str>,
-    ) -> Result<(), crate::DeviceError> {
-        let queue = &self.queue_shared.raw;
-        let retain_references = self.shared.settings.retain_command_buffer_references;
-        let relay = self.queue_shared.relay.get();
-
+    /// Reserve one slot of Metal's command buffer budget for the encoding that is
+    /// beginning. Fails (`DeviceError::Lost`) before Metal could block inside
+    /// `-commandBuffer`; the slot is released when the buffer is submitted or
+    /// dropped, or by `end_encoding`/`discard_encoding` if no native buffer was made.
+    fn reserve_command_buffer_slot(&self) -> Result<(), crate::DeviceError> {
         // Guard against exhausting Metal's command buffer budget. Use the hard
         // limit (`MAX_COMMAND_BUFFERS`) so we fail before Metal can hang inside
         // `new_command_buffer`.
@@ -180,9 +176,7 @@ impl super::CommandEncoder {
             .command_buffer_created_not_submitted
             .fetch_add(1, atomic::Ordering::AcqRel);
         if previous >= adapter::MAX_COMMAND_BUFFERS {
-            self.queue_shared
-                .command_buffer_created_not_submitted
-                .fetch_sub(1, atomic::Ordering::AcqRel);
+            self.release_command_buffer_slot();
             let current = previous + 1;
             log::warn!(
                 "metal: refusing to create new command buffer; {current} outstanding command \
@@ -193,6 +187,21 @@ impl super::CommandEncoder {
             );
             return Err(crate::DeviceError::Lost);
         }
+        Ok(())
+    }
+
+    fn release_command_buffer_slot(&self) {
+        self.queue_shared
+            .command_buffer_created_not_submitted
+            .fetch_sub(1, atomic::Ordering::AcqRel);
+    }
+
+    /// Create the `MTLCommandBuffer` for the current encoding. Its budget slot
+    /// must already be reserved (`reserve_command_buffer_slot`).
+    fn create_raw_command_buffer(&mut self, label: Option<&str>) {
+        let queue = &self.queue_shared.raw;
+        let retain_references = self.shared.settings.retain_command_buffer_references;
+        let relay = self.queue_shared.relay.get();
 
         let raw = autoreleasepool(move |_| {
             let cmd_buf_ref = if retain_references {
@@ -214,19 +223,21 @@ impl super::CommandEncoder {
             cmd_buf_ref.to_owned()
         });
         self.raw_cmd_buf = Some(raw);
-        Ok(())
     }
 
     /// The native command buffer for the current encoding, created on first use.
     ///
-    /// Panics if encoding has not begun, or if the native buffer budget is
-    /// exhausted at this point (eager creation reports that from `begin_encoding`).
+    /// Infallible: `begin_encoding` already reserved the budget slot (and returned
+    /// `DeviceError::Lost` if the budget was exhausted), so lazy creation never
+    /// introduces a new failure point. Calling it outside an encoding is a wgpu-core
+    /// bug (the hal contract requires `begin_encoding` first), as before.
     fn materialize(&mut self) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
         if let Some(label) = self.pending_begin.take() {
-            self.create_raw_command_buffer(label.as_deref())
-                .expect("metal: command buffer budget exhausted");
+            self.create_raw_command_buffer(label.as_deref());
         }
-        self.raw_cmd_buf.clone().unwrap()
+        self.raw_cmd_buf
+            .clone()
+            .expect("hal contract: command encoding has not begun")
     }
 
     fn enter_blit(&mut self) -> Retained<ProtocolObject<dyn MTLBlitCommandEncoder>> {
@@ -555,6 +566,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
         debug_assert!(self.state.pending_timer_queries.is_empty());
         debug_assert!(self.raw_cmd_buf.is_none() && self.pending_begin.is_none());
 
+        // The budget slot is reserved here in both modes, so exhaustion is still
+        // reported from `begin_encoding` as `DeviceError::Lost`, never a panic later.
+        self.reserve_command_buffer_slot()?;
         if super::lazy_command_buffers() {
             // wgpu-core opens a hal command buffer around every pass and for
             // per-submit transitions; on Metal most of those stay empty
@@ -562,7 +576,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
             self.pending_begin = Some(label.map(alloc::string::String::from));
             return Ok(());
         }
-        self.create_raw_command_buffer(label)
+        self.create_raw_command_buffer(label);
+        Ok(())
     }
 
     unsafe fn discard_encoding(&mut self) {
@@ -577,8 +592,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
             encoder.endEncoding();
         }
         self.state.pending_timer_queries.clear();
-        self.pending_begin = None;
-        let had_command_buffer = self.raw_cmd_buf.is_some();
+        // A lazily begun encoding that never created its native buffer still
+        // holds its reserved budget slot.
+        let had_command_buffer = self.raw_cmd_buf.is_some() || self.pending_begin.take().is_some();
         // Clear the Option first so the underlying `metal::CommandBuffer` is
         // dropped before we update the counter.
         self.raw_cmd_buf = None;
@@ -603,7 +619,11 @@ impl crate::CommandEncoder for super::CommandEncoder {
         debug_assert!(self.state.pending_timer_queries.is_empty());
 
         debug_assert!(self.raw_cmd_buf.is_some() != self.pending_begin.is_some());
-        self.pending_begin = None;
+        if self.pending_begin.take().is_some() {
+            // Nothing was encoded: no native buffer, so give the slot back now
+            // (submit and `Drop` only account for buffers that exist).
+            self.release_command_buffer_slot();
+        }
         Ok(super::CommandBuffer {
             raw: self.raw_cmd_buf.take(),
             queue_shared: Arc::clone(&self.queue_shared),
