@@ -1244,16 +1244,30 @@ unsafe impl Sync for StagingBuffer {}
 /// [`Device::pending_writes`]: crate::device::Device
 #[derive(Debug)]
 pub struct StagingBuffer {
-    raw: Box<dyn hal::DynBuffer>,
+    raw: StagingRaw,
     device: Arc<Device>,
     pub(crate) size: wgt::BufferSize,
     is_coherent: bool,
     ptr: NonNull<u8>,
 }
 
+/// Where a [`StagingBuffer`]'s memory lives.
+#[derive(Debug)]
+enum StagingRaw {
+    /// A hal buffer of its own, destroyed once the upload is done.
+    Owned(Box<dyn hal::DynBuffer>),
+    /// PROTOTYPE: a range of a persistently mapped chunk shared by many small
+    /// uploads (see [`StagingPool`]).
+    Pooled {
+        chunk: Arc<StagingChunkRef>,
+        offset: u64,
+    },
+}
+
 impl StagingBuffer {
     pub(crate) fn new(device: &Arc<Device>, size: wgt::BufferSize) -> Result<Self, DeviceError> {
         profiling::scope!("StagingBuffer::new");
+        staging_stats::OWNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let stage_desc = hal::BufferDescriptor {
             label: hal_label(Some("(wgpu internal) Staging"), device.instance_flags),
             size: size.get(),
@@ -1267,7 +1281,7 @@ impl StagingBuffer {
             .map_err(|e| device.handle_hal_error(e))?;
 
         let staging_buffer = StagingBuffer {
-            raw,
+            raw: StagingRaw::Owned(raw),
             device: device.clone(),
             size,
             is_coherent: mapping.is_coherent,
@@ -1275,6 +1289,32 @@ impl StagingBuffer {
         };
 
         Ok(staging_buffer)
+    }
+
+    /// PROTOTYPE: like [`Self::new`], but small sizes are sub-allocated from
+    /// the queue's [`StagingPool`] when it has one.
+    pub(crate) fn new_pooled(
+        pool: Option<&Arc<StagingPool>>,
+        device: &Arc<Device>,
+        size: wgt::BufferSize,
+    ) -> Result<Self, DeviceError> {
+        staging_stats::record_size(size.get());
+        if let Some(pool) = pool {
+            if let Some((chunk, offset)) = pool.alloc(size.get())? {
+                staging_stats::POOLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                // SAFETY: `alloc` returned a range inside the mapped chunk.
+                let ptr = unsafe { NonNull::new_unchecked(chunk.ptr().as_ptr().add(offset as usize)) };
+                let is_coherent = chunk.chunk.is_coherent;
+                return Ok(StagingBuffer {
+                    raw: StagingRaw::Pooled { chunk, offset },
+                    device: device.clone(),
+                    size,
+                    is_coherent,
+                    ptr,
+                });
+            }
+        }
+        Self::new(device, size)
     }
 
     /// SAFETY: You must not call any functions of `self`
@@ -1330,25 +1370,269 @@ impl StagingBuffer {
     }
 
     pub(crate) fn flush(self) -> FlushedStagingBuffer {
-        let device = self.device.raw();
-        if !self.is_coherent {
-            #[allow(clippy::single_range_in_vec_init)]
-            unsafe {
-                device.flush_mapped_ranges(self.raw.as_ref(), &[0..self.size.get()])
-            };
-        }
-        unsafe { device.unmap_buffer(self.raw.as_ref()) };
-
         let StagingBuffer {
-            raw, device, size, ..
-        } = self;
-
-        FlushedStagingBuffer {
-            raw: ManuallyDrop::new(raw),
-            device,
+            raw,
+            device: device_arc,
             size,
+            is_coherent,
+            ..
+        } = self;
+        let device = device_arc.raw();
+        match raw {
+            StagingRaw::Owned(raw) => {
+                if !is_coherent {
+                    #[allow(clippy::single_range_in_vec_init)]
+                    unsafe {
+                        device.flush_mapped_ranges(raw.as_ref(), &[0..size.get()])
+                    };
+                }
+                unsafe { device.unmap_buffer(raw.as_ref()) };
+                FlushedStagingBuffer {
+                    raw: FlushedRaw::Owned(ManuallyDrop::new(raw)),
+                    device: device_arc,
+                    size,
+                    offset: 0,
+                }
+            }
+            StagingRaw::Pooled { chunk, offset } => {
+                if !is_coherent {
+                    #[allow(clippy::single_range_in_vec_init)]
+                    unsafe {
+                        device.flush_mapped_ranges(chunk.raw(), &[offset..offset + size.get()])
+                    };
+                }
+                // The chunk stays mapped for its whole life.
+                FlushedStagingBuffer {
+                    raw: FlushedRaw::Pooled(chunk),
+                    device: device_arc,
+                    size,
+                    offset,
+                }
+            }
         }
     }
+}
+
+/// PROTOTYPE: per-queue pool of persistently mapped staging chunks.
+///
+/// `Queue::write_buffer` and `create_staging_buffer` used to create (and, on
+/// completion, destroy) a hal buffer per call. Small uploads are now bump
+/// allocated from 4 MiB chunks. A chunk goes back on the free list when the
+/// last [`FlushedStagingBuffer`] using it is dropped, which happens when the
+/// submission that read it has completed.
+pub(crate) struct StagingPool {
+    device: Arc<Device>,
+    this: alloc::sync::Weak<StagingPool>,
+    inner: parking_lot::Mutex<StagingPoolInner>,
+}
+
+struct StagingPoolInner {
+    free: Vec<StagingChunk>,
+    current: Option<Arc<StagingChunkRef>>,
+    cursor: u64,
+}
+
+pub(crate) struct StagingChunk {
+    raw: Box<dyn hal::DynBuffer>,
+    ptr: NonNull<u8>,
+    is_coherent: bool,
+}
+
+#[cfg(send_sync)]
+unsafe impl Send for StagingChunk {}
+#[cfg(send_sync)]
+unsafe impl Sync for StagingChunk {}
+
+/// A chunk in use: returns to the pool's free list when dropped.
+pub(crate) struct StagingChunkRef {
+    chunk: ManuallyDrop<StagingChunk>,
+    pool: alloc::sync::Weak<StagingPool>,
+    device: Arc<Device>,
+}
+
+impl fmt::Debug for StagingChunkRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StagingChunkRef").finish_non_exhaustive()
+    }
+}
+
+impl StagingChunkRef {
+    fn raw(&self) -> &dyn hal::DynBuffer {
+        self.chunk.raw.as_ref()
+    }
+    fn ptr(&self) -> NonNull<u8> {
+        self.chunk.ptr
+    }
+}
+
+impl Drop for StagingChunkRef {
+    fn drop(&mut self) {
+        // SAFETY: not used after this point.
+        let chunk = unsafe { ManuallyDrop::take(&mut self.chunk) };
+        if let Some(pool) = self.pool.upgrade() {
+            let mut inner = pool.inner.lock();
+            if inner.free.len() < StagingPool::MAX_FREE_CHUNKS {
+                inner.free.push(chunk);
+                return;
+            }
+        }
+        destroy_staging_chunk(&self.device, chunk);
+    }
+}
+
+fn destroy_staging_chunk(device: &Device, chunk: StagingChunk) {
+    staging_stats::CHUNKS_DESTROYED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        device.raw().unmap_buffer(chunk.raw.as_ref());
+        device.raw().destroy_buffer(chunk.raw);
+    }
+}
+
+impl StagingPool {
+    pub(crate) const CHUNK_SIZE: u64 = 4 << 20;
+    /// Larger uploads keep a buffer of their own.
+    pub(crate) const MAX_POOLED: u64 = 1 << 20;
+    const MAX_FREE_CHUNKS: usize = 16;
+    const ALIGNMENT: u64 = 16;
+
+    /// `None` unless enabled: Metal only for now (persistent mapping is free
+    /// there; GLES needs unmap before use). `WGPU_STAGING_POOL=0` disables.
+    pub(crate) fn new_if_enabled(device: &Arc<Device>) -> Option<Arc<Self>> {
+        #[cfg(feature = "std")]
+        let on = std::env::var("WGPU_STAGING_POOL").map_or(true, |v| v != "0");
+        #[cfg(not(feature = "std"))]
+        let on = true;
+        if !on || device.backend() != wgt::Backend::Metal {
+            return None;
+        }
+        Some(Arc::new_cyclic(|this| StagingPool {
+            device: device.clone(),
+            this: this.clone(),
+            inner: parking_lot::Mutex::new(StagingPoolInner {
+                free: Vec::new(),
+                current: None,
+                cursor: 0,
+            }),
+        }))
+    }
+
+    fn create_chunk(&self) -> Result<StagingChunk, DeviceError> {
+        staging_stats::CHUNKS_CREATED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let device = &self.device;
+        let desc = hal::BufferDescriptor {
+            label: hal_label(Some("(wgpu internal) Staging pool"), device.instance_flags),
+            size: Self::CHUNK_SIZE,
+            usage: wgt::BufferUses::MAP_WRITE | wgt::BufferUses::COPY_SRC,
+            memory_flags: hal::MemoryFlags::empty(),
+        };
+        let raw = unsafe { device.raw().create_buffer(&desc) }
+            .map_err(|e| device.handle_hal_error(e))?;
+        let mapping = unsafe { device.raw().map_buffer(raw.as_ref(), 0..Self::CHUNK_SIZE) }
+            .map_err(|e| device.handle_hal_error(e))?;
+        Ok(StagingChunk {
+            raw,
+            ptr: mapping.ptr,
+            is_coherent: mapping.is_coherent,
+        })
+    }
+
+    /// A `size`-byte range of a chunk, or `None` if `size` is too large to pool.
+    fn alloc(&self, size: u64) -> Result<Option<(Arc<StagingChunkRef>, u64)>, DeviceError> {
+        if size > Self::MAX_POOLED {
+            return Ok(None);
+        }
+        let aligned = wgt::math::align_to(size, Self::ALIGNMENT);
+        // A replaced chunk may be the last reference: drop it after unlocking,
+        // since its `Drop` takes the pool lock.
+        let mut retired = None;
+        let result = {
+            let mut inner = self.inner.lock();
+            if inner.current.is_none() || inner.cursor + aligned > Self::CHUNK_SIZE {
+                retired = inner.current.take();
+                let chunk = match inner.free.pop() {
+                    Some(chunk) => chunk,
+                    None => self.create_chunk()?,
+                };
+                inner.current = Some(Arc::new(StagingChunkRef {
+                    chunk: ManuallyDrop::new(chunk),
+                    pool: self.this.clone(),
+                    device: self.device.clone(),
+                }));
+                inner.cursor = 0;
+            }
+            let offset = inner.cursor;
+            inner.cursor += aligned;
+            Some((inner.current.clone().unwrap(), offset))
+        };
+        drop(retired);
+        Ok(result)
+    }
+}
+
+impl Drop for StagingPool {
+    fn drop(&mut self) {
+        let inner = self.inner.get_mut();
+        // `current` is a `StagingChunkRef`; its upgrade of `this` fails now, so
+        // it destroys its chunk itself.
+        inner.current = None;
+        for chunk in mem::take(&mut inner.free) {
+            destroy_staging_chunk(&self.device, chunk);
+        }
+    }
+}
+
+/// PROTOTYPE: `WGPU_STAGING_STATS=1` logs staging traffic every 2 s (stderr).
+pub(crate) mod staging_stats {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static OWNED: AtomicU64 = AtomicU64::new(0);
+    pub static POOLED: AtomicU64 = AtomicU64::new(0);
+    pub static CHUNKS_CREATED: AtomicU64 = AtomicU64::new(0);
+    pub static CHUNKS_DESTROYED: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+    /// <=256 B, <=4 KiB, <=64 KiB, <=1 MiB, >1 MiB
+    pub static HIST: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    pub static WRITE_TEXTURE: AtomicU64 = AtomicU64::new(0);
+
+    pub fn record_size(size: u64) {
+        BYTES.fetch_add(size, Relaxed);
+        let i = match size {
+            0..=256 => 0,
+            257..=4096 => 1,
+            4097..=65536 => 2,
+            65537..=1048576 => 3,
+            _ => 4,
+        };
+        HIST[i].fetch_add(1, Relaxed);
+    }
+
+    #[cfg(feature = "std")]
+    pub fn maybe_report() {
+        use std::sync::{Mutex, OnceLock};
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("WGPU_STAGING_STATS").is_some()) {
+            return;
+        }
+        static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let mut last = LAST.lock().unwrap();
+        let now = std::time::Instant::now();
+        match *last {
+            None => *last = Some(now),
+            Some(t) if now.duration_since(t).as_secs_f64() >= 2.0 => {
+                let secs = now.duration_since(t).as_secs_f64();
+                *last = Some(now);
+                let take = |a: &AtomicU64| a.swap(0, Relaxed) as f64 / secs;
+                let h: [f64; 5] = core::array::from_fn(|i| take(&HIST[i]));
+                std::eprintln!(
+                    "[wgpu-staging] per s: owned_bufs={:.0} pooled={:.0} bytes={:.0}KiB hist(<=256,<=4K,<=64K,<=1M,>1M)={:.0}/{:.0}/{:.0}/{:.0}/{:.0} write_texture={:.0} chunks+={:.1} chunks-={:.1}",
+                    take(&OWNED), take(&POOLED), take(&BYTES) / 1024.0, h[0], h[1], h[2], h[3], h[4],
+                    take(&WRITE_TEXTURE), take(&CHUNKS_CREATED), take(&CHUNKS_DESTROYED)
+                );
+            }
+            _ => {}
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    pub fn maybe_report() {}
 }
 
 crate::impl_resource_type!(StagingBuffer);
@@ -1356,23 +1640,37 @@ crate::impl_storage_item!(StagingBuffer);
 
 #[derive(Debug)]
 pub struct FlushedStagingBuffer {
-    raw: ManuallyDrop<Box<dyn hal::DynBuffer>>,
+    raw: FlushedRaw,
     device: Arc<Device>,
     pub(crate) size: wgt::BufferSize,
+    /// Offset of the data in [`Self::raw`] (non-zero for pooled uploads).
+    pub(crate) offset: u64,
+}
+
+#[derive(Debug)]
+enum FlushedRaw {
+    Owned(ManuallyDrop<Box<dyn hal::DynBuffer>>),
+    Pooled(Arc<StagingChunkRef>),
 }
 
 impl FlushedStagingBuffer {
     pub(crate) fn raw(&self) -> &dyn hal::DynBuffer {
-        self.raw.as_ref()
+        match &self.raw {
+            FlushedRaw::Owned(raw) => raw.as_ref(),
+            FlushedRaw::Pooled(chunk) => chunk.raw(),
+        }
     }
 }
 
 impl Drop for FlushedStagingBuffer {
     fn drop(&mut self) {
-        resource_log!("Destroy raw StagingBuffer");
-        // SAFETY: We are in the Drop impl and we don't use self.raw anymore after this point.
-        let raw = unsafe { ManuallyDrop::take(&mut self.raw) };
-        unsafe { self.device.raw().destroy_buffer(raw) };
+        if let FlushedRaw::Owned(raw) = &mut self.raw {
+            resource_log!("Destroy raw StagingBuffer");
+            // SAFETY: We are in the Drop impl and we don't use self.raw anymore after this point.
+            let raw = unsafe { ManuallyDrop::take(raw) };
+            unsafe { self.device.raw().destroy_buffer(raw) };
+        }
+        // A pooled chunk returns to its pool when its last user is dropped.
     }
 }
 
