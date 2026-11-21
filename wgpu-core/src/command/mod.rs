@@ -760,7 +760,7 @@ impl InnerCommandEncoder {
     /// If the command encoder was already open, does nothing.
     ///
     /// In both cases, returns a reference to the raw encoder.
-    fn open_if_closed(&mut self) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
+    pub(crate) fn open_if_closed(&mut self) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
         if !self.is_open {
             let hal_label = hal_label(Some(self.label.as_str()), self.device.instance_flags);
             unsafe { self.raw.begin_encoding(hal_label) }
@@ -2128,4 +2128,18 @@ impl WebGpuError for PassStateError {
         let Self { scope: _, inner } = self;
         inner.webgpu_error_type()
     }
+}
+
+/// PROTOTYPE: backends whose buffer/texture transitions and query resets are
+/// no-ops (Metal), so pass preparation may be recorded after the pass.
+/// `WGPU_PASS_APPEND=0` turns the pass coalescing off for A/B.
+pub(crate) fn pass_barriers_are_noop(device: &crate::device::Device) -> bool {
+    #[cfg(feature = "std")]
+    let on = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("WGPU_PASS_APPEND").map_or(true, |v| v != "0"))
+    };
+    #[cfg(not(feature = "std"))]
+    let on = true;
+    device.backend() == wgt::Backend::Metal && on
 }

@@ -663,17 +663,32 @@ pub(super) fn encode_compute_pass(
 
     let device = parent_state.device;
 
-    // We automatically keep extending command buffers over time, and because
-    // we want to insert a command buffer _before_ what we're about to record,
-    // we need to make sure to close the previous one.
-    parent_state
-        .raw_encoder
-        .close_if_open()
-        .map_pass_err(pass_scope)?;
-    let raw_encoder = parent_state
-        .raw_encoder
-        .open_pass(base.label.as_deref())
-        .map_pass_err(pass_scope)?;
+    // PROTOTYPE (backport of gfx-rs/wgpu#10506): see `encode_render_pass`.
+    let append = crate::command::pass_barriers_are_noop(device)
+        && !base.commands.iter().any(|command| match command {
+            ArcComputeCommand::SetBindGroup {
+                bind_group: Some(group),
+                ..
+            } => group.texture_init_actions.iter().any(|action| {
+                parent_state
+                    .texture_memory_actions
+                    .has_discarded_texture(&action.texture)
+            }),
+            _ => false,
+        });
+    let raw_encoder = if append {
+        parent_state.raw_encoder.open_if_closed()
+    } else {
+        // We automatically keep extending command buffers over time, and because
+        // we want to insert a command buffer _before_ what we're about to record,
+        // we need to make sure to close the previous one.
+        parent_state
+            .raw_encoder
+            .close_if_open()
+            .map_pass_err(pass_scope)?;
+        parent_state.raw_encoder.open_pass(base.label.as_deref())
+    }
+    .map_pass_err(pass_scope)?;
 
     let mut debug_scope_depth = 0;
 
@@ -925,18 +940,24 @@ pub(super) fn encode_compute_pass(
     } = state;
 
     // Stop the current command encoder.
-    parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
+    if !append {
+        parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
+    }
 
     // Create a new command encoder, which we will insert _before_ the body of the compute pass.
     //
     // Use that buffer to insert barriers and clear discarded images.
-    let transit = parent_state
-        .raw_encoder
-        .open_pass(hal_label(
+    // (When appending, only no-op preparation can follow the pass.)
+    assert!(!append || pending_discard_init_fixups.is_empty());
+    let transit = if append {
+        parent_state.raw_encoder.open_if_closed()
+    } else {
+        parent_state.raw_encoder.open_pass(hal_label(
             Some("(wgpu internal) Pre Pass"),
             device.instance_flags,
         ))
-        .map_pass_err(pass_scope)?;
+    }
+    .map_pass_err(pass_scope)?;
     fixup_discarded_surfaces(
         pending_discard_init_fixups.into_iter(),
         transit,
@@ -951,10 +972,12 @@ pub(super) fn encode_compute_pass(
         parent_state.snatch_guard,
     );
     // Close the command encoder, and swap it with the previous.
-    parent_state
-        .raw_encoder
-        .close_and_swap()
-        .map_pass_err(pass_scope)?;
+    if !append {
+        parent_state
+            .raw_encoder
+            .close_and_swap()
+            .map_pass_err(pass_scope)?;
+    }
 
     Ok(())
 }
