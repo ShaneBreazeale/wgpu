@@ -34,6 +34,7 @@ mod draw_index;
 mod draw_indirect;
 mod dual_source_blending;
 mod encoder;
+mod encoder_append;
 mod external_image_copy;
 mod external_texture;
 mod float32_filterable;
@@ -112,6 +113,7 @@ fn all_tests() -> Vec<wgpu_test::GpuTestInitializer> {
     draw_indirect::all_tests(&mut tests);
     dual_source_blending::all_tests(&mut tests);
     encoder::all_tests(&mut tests);
+    encoder_append::all_tests(&mut tests);
     external_texture::all_tests(&mut tests);
     float32_filterable::all_tests(&mut tests);
     image_atomics::all_tests(&mut tests);

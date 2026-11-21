@@ -1813,6 +1813,67 @@ impl Global {
         )
     }
 
+    /// Move every command recorded on `src` to the end of `dst`, as
+    /// if they had been recorded on `dst` (wgpu-core records commands and
+    /// encodes them at `finish`, so this is exact). Returns `false`, leaving
+    /// both untouched, unless both encoders are open (not locked by a pass,
+    /// not finished, not invalid) and neither uses raw hal encoding.
+    ///
+    /// Lets a caller that records on many encoders in parallel submit fewer,
+    /// larger command buffers (one native command buffer each on Metal).
+    pub fn command_encoder_append(
+        &self,
+        dst: id::CommandEncoderId,
+        src: id::CommandEncoderId,
+    ) -> bool {
+        profiling::scope!("CommandEncoder::append");
+        if dst == src {
+            return false;
+        }
+        let hub = &self.hub;
+        let src_enc = hub.command_encoders.get(src);
+        let dst_enc = hub.command_encoders.get(dst);
+        if !Arc::ptr_eq(&src_enc.device, &dst_enc.device) {
+            return false;
+        }
+        let open = |state: &CommandEncoderStatus| match state {
+            CommandEncoderStatus::Recording(data) => data.encoder.api != EncodingApi::Raw,
+            _ => false,
+        };
+        // Check `dst` first, then take `src`'s commands, then append; one lock at a time.
+        if !open(&dst_enc.data.lock()) {
+            return false;
+        }
+        let commands = {
+            let mut src_state = src_enc.data.lock();
+            if !open(&src_state) {
+                return false;
+            }
+            let CommandEncoderStatus::Recording(data) = &mut *src_state else {
+                unreachable!()
+            };
+            mem::take(&mut data.commands)
+        };
+        let mut dst_state = dst_enc.data.lock();
+        match &mut *dst_state {
+            CommandEncoderStatus::Recording(data) if data.encoder.api != EncodingApi::Raw => {
+                if !commands.is_empty() {
+                    data.encoder.api.set(EncodingApi::Wgpu);
+                }
+                data.commands.extend(commands);
+                true
+            }
+            _ => {
+                // `dst` changed state in between (another thread); give the commands back.
+                drop(dst_state);
+                if let CommandEncoderStatus::Recording(data) = &mut *src_enc.data.lock() {
+                    data.commands.splice(0..0, commands);
+                }
+                false
+            }
+        }
+    }
+
     pub fn command_encoder_push_debug_group(
         &self,
         encoder_id: id::CommandEncoderId,
