@@ -734,6 +734,10 @@ impl crate::Queue for Queue {
                 }
             }
 
+            let last_with_work = command_buffers
+                .iter()
+                .rev()
+                .find_map(|cmd_buf| cmd_buf.raw.as_ref());
             let extra_command_buffer = {
                 let fence_sync = Arc::clone(&signal_fence.sync);
                 let block = block2::RcBlock::new(move |_cmd_buf| {
@@ -741,8 +745,8 @@ impl crate::Queue for Queue {
                     fence_sync.1.notify_all();
                 });
 
-                let raw = match command_buffers.last() {
-                    Some(&cmd_buf) => cmd_buf.raw.clone(),
+                let raw = match last_with_work {
+                    Some(raw) => raw.clone(),
                     None => {
                         // We do not bother adjusting `command_buffer_created_not_submitted`
                         // because we immediately commit this buffer.
@@ -775,14 +779,19 @@ impl crate::Queue for Queue {
                 }
 
                 // only return an extra one if it's extra
-                match command_buffers.last() {
+                match last_with_work {
                     Some(_) => None,
                     None => Some(raw),
                 }
             };
 
             for cmd_buffer in command_buffers {
-                cmd_buffer.raw.commit();
+                // Command buffers with no work never created a native buffer
+                // (and never touched the outstanding-buffer counter).
+                let Some(raw) = cmd_buffer.raw.as_ref() else {
+                    continue;
+                };
+                raw.commit();
                 // One command buffer per `end_encoding` call moves from the
                 // "created but not yet submitted" bucket into the submitted
                 // set, so update the counter.
@@ -1354,6 +1363,10 @@ pub struct CommandEncoder {
     shared: Arc<AdapterShared>,
     queue_shared: Arc<QueueShared>,
     raw_cmd_buf: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    /// Lazy command buffers: `begin_encoding` only records that encoding has
+    /// begun (and the label); the `MTLCommandBuffer` is created on the first
+    /// command that needs one. `Some` = open with no native buffer yet.
+    pending_begin: Option<Option<String>>,
     state: CommandState,
     temp: Temp,
     counters: Arc<wgt::HalCounters>,
@@ -1372,8 +1385,15 @@ unsafe impl Sync for CommandEncoder {}
 
 #[derive(Debug)]
 pub struct CommandBuffer {
-    raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    /// `None` if nothing was encoded: there is nothing to commit.
+    raw: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     queue_shared: Arc<QueueShared>,
+}
+
+/// PROTOTYPE knob: `WGPU_METAL_LAZY_CB=0` restores eager command buffer creation.
+pub(super) fn lazy_command_buffers() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("WGPU_METAL_LAZY_CB").map_or(true, |v| v != "0"))
 }
 
 impl crate::DynCommandBuffer for CommandBuffer {}
