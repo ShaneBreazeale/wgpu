@@ -63,6 +63,24 @@ impl CommandEncoder {
         CommandBuffer { buffer, actions }
     }
 
+    /// PROTOTYPE: moves every command recorded on `other` to the end of `self`, so that
+    /// both submit as one command buffer, exactly as if they had been recorded on `self`.
+    /// Only for the wgpu-core backend; on any failure (other backend, either encoder locked
+    /// by a pass, finished, invalid or using raw hal encoding) `other` is handed back
+    /// untouched.
+    pub fn append(&mut self, other: CommandEncoder) -> Result<(), CommandEncoder> {
+        #[cfg(wgpu_core)]
+        if let (Some(dst), Some(src)) = (self.inner.as_core_opt(), other.inner.as_core_opt()) {
+            if dst.context.0.command_encoder_append(dst.id, src.id) {
+                let mut src_actions = other.actions.lock();
+                self.actions.lock().append(&mut src_actions);
+                drop(src_actions);
+                return Ok(());
+            }
+        }
+        Err(other)
+    }
+
     /// Begins recording of a render pass.
     ///
     /// This function returns a [`RenderPass`] object which records a single render pass.
