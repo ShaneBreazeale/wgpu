@@ -41,7 +41,7 @@ use crate::{dispatch::DispatchAdapter, util::Mutex};
 mod thread_id;
 
 #[derive(Clone)]
-pub struct ContextWgpuCore(Arc<wgc::global::Global>);
+pub struct ContextWgpuCore(pub(crate) Arc<wgc::global::Global>);
 
 impl Drop for ContextWgpuCore {
     fn drop(&mut self) {
@@ -598,7 +598,7 @@ pub struct CoreRenderPass {
 #[derive(Debug)]
 pub struct CoreCommandEncoder {
     pub(crate) context: ContextWgpuCore,
-    id: wgc::id::CommandEncoderId,
+    pub(crate) id: wgc::id::CommandEncoderId,
     error_sink: ErrorSink,
 }
 
