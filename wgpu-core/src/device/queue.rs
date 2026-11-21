@@ -51,6 +51,8 @@ pub struct Queue {
     raw: Box<dyn hal::DynQueue>,
     pub(crate) pending_writes: Mutex<PendingWrites>,
     life_tracker: Mutex<LifetimeTracker>,
+    /// Sub-allocated staging memory for small uploads (`None` where not enabled).
+    staging_pool: Option<Arc<crate::resource::StagingPool>>,
     // The device needs to be dropped last (`Device.zero_buffer` might be referenced by the encoder in pending writes).
     pub(crate) device: Arc<Device>,
 }
@@ -103,6 +105,7 @@ impl Queue {
 
         Ok(Queue {
             raw,
+            staging_pool: crate::resource::StagingPool::new_if_enabled(&device),
             device,
             pending_writes: Mutex::new(rank::QUEUE_PENDING_WRITES, pending_writes),
             life_tracker: Mutex::new(rank::QUEUE_LIFE_TRACKER, LifetimeTracker::new()),
@@ -659,7 +662,8 @@ impl Queue {
         // Platform validation requires that the staging buffer always be
         // freed, even if an error occurs. All paths from here must call
         // `device.pending_writes.consume`.
-        let mut staging_buffer = StagingBuffer::new(&self.device, data_size)?;
+        let mut staging_buffer =
+            StagingBuffer::new_pooled(self.staging_pool.as_ref(), &self.device, data_size)?;
 
         let staging_buffer = {
             profiling::scope!("copy");
@@ -696,7 +700,8 @@ impl Queue {
 
         self.device.check_is_valid()?;
 
-        let staging_buffer = StagingBuffer::new(&self.device, buffer_size)?;
+        let staging_buffer =
+            StagingBuffer::new_pooled(self.staging_pool.as_ref(), &self.device, buffer_size)?;
         let ptr = unsafe { staging_buffer.ptr() };
 
         Ok((staging_buffer, ptr))
@@ -817,7 +822,7 @@ impl Queue {
         self.validate_write_buffer_impl(&buffer, buffer_offset, staging_buffer.size.into())?;
 
         let region = hal::BufferCopy {
-            src_offset: 0,
+            src_offset: staging_buffer.offset,
             dst_offset: buffer_offset,
             size: staging_buffer.size,
         };
