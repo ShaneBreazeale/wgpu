@@ -780,7 +780,9 @@ impl InnerCommandEncoder {
     /// If the command encoder was already open, does nothing.
     ///
     /// In both cases, returns a reference to the raw encoder.
-    fn open_if_closed(&mut self) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
+    pub(crate) fn open_if_closed(
+        &mut self,
+    ) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
         if !self.is_open {
             let hal_label = hal_label(Some(self.label.as_str()), self.device.instance_flags);
             unsafe { self.raw.begin_encoding(hal_label) }
@@ -2168,4 +2170,10 @@ impl WebGpuError for PassStateError {
         let Self { scope: _, inner } = self;
         inner.webgpu_error_type()
     }
+}
+
+/// Backends whose buffer/texture transitions and query resets are no-ops (Metal),
+/// so a pass's preparation may be recorded after the pass in the same command buffer.
+pub(crate) fn pass_barriers_are_noop(device: &Device) -> bool {
+    device.backend() == wgt::Backend::Metal
 }
